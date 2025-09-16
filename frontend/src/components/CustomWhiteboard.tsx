@@ -1,7 +1,8 @@
 "use client";
 
-import { useRef, useEffect, useState, useCallback } from 'react';
-import { ShareButton } from './ShareButton';
+import { useRef, useEffect, useState, useCallback, MutableRefObject } from 'react';
+import type { Socket } from 'socket.io-client';
+// Share removed from whiteboard
 
 interface Point {
   x: number;
@@ -13,7 +14,15 @@ interface DrawingHistory {
   timestamp: number;
 }
 
-export const CustomWhiteboard = () => {
+interface CustomWhiteboardProps {
+  roomId?: string;
+  socket?: MutableRefObject<Socket | null>;
+  initialImage?: string;
+}
+
+const LARGE_CANVAS_SIZE = 3000; // simulate infinite via large canvas
+
+export const CustomWhiteboard = ({ roomId, socket, initialImage }: CustomWhiteboardProps) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [currentTool, setCurrentTool] = useState('pen');
@@ -24,33 +33,24 @@ export const CustomWhiteboard = () => {
   const [historyStep, setHistoryStep] = useState(-1);
   const [savedImageData, setSavedImageData] = useState<ImageData | null>(null);
   const [coordinates, setCoordinates] = useState('Position: (0, 0)');
-  const [shareUrl, setShareUrl] = useState('');
+  // removed share state
+  const [textBox, setTextBox] = useState<{ x: number; y: number; value: string; visible: boolean }>({ x: 0, y: 0, value: '', visible: false });
+  const textInputRef = useRef<HTMLInputElement>(null);
 
   const ctx = useRef<CanvasRenderingContext2D | null>(null);
+  const isRemoteUpdate = useRef(false);
+  const lastEmitTimeRef = useRef(0);
 
-  // Initialize canvas
+  // Keyboard shortcuts: Ctrl+Z / Ctrl+Y
+  // (moved below after function declarations to avoid TDZ issues)
+
+  // Text tool: draw text on click
+  // moved below after saveState initialization to avoid TDZ issues
+
+  // Initialize canvas (fixed large size, scrollable container)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
-    const resizeCanvas = () => {
-      const container = canvas.parentElement;
-      if (!container) return;
-
-      const rect = container.getBoundingClientRect();
-      canvas.width = rect.width;
-      canvas.height = rect.height;
-      
-      // Redraw current state after resize
-      if (historyStep >= 0 && history[historyStep]) {
-        const img = new Image();
-        img.onload = () => {
-          ctx.current?.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.current?.drawImage(img, 0, 0);
-        };
-        img.src = history[historyStep].dataURL;
-      }
-    };
 
     ctx.current = canvas.getContext('2d');
     if (ctx.current) {
@@ -59,35 +59,56 @@ export const CustomWhiteboard = () => {
       ctx.current.imageSmoothingEnabled = true;
     }
 
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas);
+    canvas.width = LARGE_CANVAS_SIZE;
+    canvas.height = LARGE_CANVAS_SIZE;
 
-    // Save initial state
-    saveState();
-
-    return () => {
-      window.removeEventListener('resize', resizeCanvas);
-    };
-  }, []);
+    // Load initial image from server if provided, else from localStorage
+    try {
+      if (initialImage) {
+        const img = new Image();
+        img.onload = () => {
+          ctx.current?.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.current?.drawImage(img, 0, 0);
+          saveState();
+        };
+        img.src = initialImage;
+      } else if (roomId) {
+        const saved = localStorage.getItem(`whiteboard:${roomId}`);
+        if (saved) {
+          const img = new Image();
+          img.onload = () => {
+            ctx.current?.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.current?.drawImage(img, 0, 0);
+            saveState();
+          };
+          img.src = saved;
+        } else {
+          saveState();
+        }
+      } else {
+        saveState();
+      }
+    } catch {
+      saveState();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, initialImage]);
 
   const saveState = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const newHistory = history.slice(0, historyStep + 1);
-    newHistory.push({
-      dataURL: canvas.toDataURL(),
-      timestamp: Date.now()
-    });
-
-    // Limit history to prevent memory issues
-    if (newHistory.length > 50) {
-      newHistory.shift();
-    }
-
+    newHistory.push({ dataURL: canvas.toDataURL(), timestamp: Date.now() });
+    if (newHistory.length > 50) newHistory.shift();
     setHistory(newHistory);
     setHistoryStep(newHistory.length - 1);
-  }, [history, historyStep]);
+
+    // Persist in localStorage
+    if (roomId) {
+      try { localStorage.setItem(`whiteboard:${roomId}`, canvas.toDataURL()); } catch {}
+    }
+  }, [history, historyStep, roomId]);
 
   const restoreState = useCallback((step: number) => {
     const canvas = canvasRef.current;
@@ -105,12 +126,14 @@ export const CustomWhiteboard = () => {
   const undo = useCallback(() => {
     if (historyStep > 0) {
       restoreState(historyStep - 1);
+      emitCanvasStateThrottled();
     }
   }, [historyStep, restoreState]);
 
   const redo = useCallback(() => {
     if (historyStep < history.length - 1) {
       restoreState(historyStep + 1);
+      emitCanvasStateThrottled();
     }
   }, [historyStep, history.length, restoreState]);
 
@@ -120,6 +143,7 @@ export const CustomWhiteboard = () => {
 
     ctx.current.clearRect(0, 0, canvas.width, canvas.height);
     saveState();
+    emitCanvasStateThrottled();
   }, [saveState]);
 
   const getMousePos = useCallback((e: React.MouseEvent | MouseEvent) => {
@@ -138,12 +162,20 @@ export const CustomWhiteboard = () => {
     setCoordinates(`Position: (${Math.round(pos.x)}, ${Math.round(pos.y)})`);
   }, [getMousePos]);
 
+  const drawTextAtRef = useRef<(x: number, y: number) => void>(() => {});
+
+  // drawTextAt is defined after emitCanvasStateThrottled to avoid TDZ
+
   const startDrawing = useCallback((e: React.MouseEvent) => {
+    if (currentTool === 'text') {
+      const pos = getMousePos(e);
+      drawTextAtRef.current(pos.x, pos.y);
+      return;
+    }
     setIsDrawing(true);
     const pos = getMousePos(e);
     setStartPos(pos);
 
-    // Save current canvas state for shape preview
     const canvas = canvasRef.current;
     if (canvas && ctx.current && currentTool !== 'pen' && currentTool !== 'eraser') {
       setSavedImageData(ctx.current.getImageData(0, 0, canvas.width, canvas.height));
@@ -193,6 +225,8 @@ export const CustomWhiteboard = () => {
         }
         break;
     }
+
+    emitCanvasStateThrottled();
   }, [isDrawing, currentTool, currentSize, currentColor, savedImageData, startPos, getMousePos, updateCoordinates]);
 
   const drawRectangle = useCallback((x: number, y: number, width: number, height: number) => {
@@ -230,6 +264,7 @@ export const CustomWhiteboard = () => {
       }
       setSavedImageData(null);
       saveState();
+      emitCanvasStateThrottled();
     }
   }, [isDrawing, saveState]);
 
@@ -259,20 +294,103 @@ export const CustomWhiteboard = () => {
     };
   }, []);
 
+  // Emit canvas updates (throttled)
+  const emitCanvasStateThrottled = useCallback(() => {
+    if (!roomId || !socket?.current) return;
+    const now = Date.now();
+    if (now - lastEmitTimeRef.current < 100) return;
+    lastEmitTimeRef.current = now;
+    const payload = getCanvasData();
+    if (!payload) return;
+    if (!isRemoteUpdate.current) {
+      socket.current.emit('whiteboard_change', { roomId, drawing: payload });
+    } else {
+      isRemoteUpdate.current = false;
+    }
+    try { localStorage.setItem(`whiteboard:${roomId}`, payload.dataURL); } catch {}
+  }, [roomId, socket, getCanvasData]);
+
+  // Text tool: draw text on click (after emitCanvasStateThrottled is defined)
+  const drawTextAt = useCallback((x: number, y: number) => {
+    // Show input box at clicked position and focus
+    setTextBox({ x, y, value: '', visible: true });
+    // focus next tick
+    setTimeout(() => { textInputRef.current?.focus(); }, 0);
+  }, []);
+
+  useEffect(() => {
+    drawTextAtRef.current = drawTextAt;
+  }, [drawTextAt]);
+
+  // When receiving remote update, also persist
+  useEffect(() => {
+    if (!socket?.current) return;
+    const s = socket.current;
+    const handler = ({ drawing }: { drawing: { dataURL: string } }) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const img = new Image();
+      img.onload = () => {
+        const ctx2d = canvas.getContext('2d');
+        if (!ctx2d) return;
+        ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+        ctx2d.drawImage(img, 0, 0, canvas.width, canvas.height);
+        try { if (roomId) localStorage.setItem(`whiteboard:${roomId}`, canvas.toDataURL()); } catch {}
+      };
+      isRemoteUpdate.current = true;
+      img.src = drawing.dataURL;
+    };
+    s.on('whiteboard_update', handler);
+    return () => { s.off('whiteboard_update', handler); };
+  }, [socket, roomId]);
+
   useEffect(() => {
     updateCursor();
   }, [currentTool, updateCursor]);
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const isCtrl = e.ctrlKey || e.metaKey;
+      if (isCtrl && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault();
+        if (historyStep > 0) {
+          restoreState(historyStep - 1);
+          emitCanvasStateThrottled();
+        }
+      } else if ((isCtrl && e.key.toLowerCase() === 'y') || (isCtrl && e.shiftKey && e.key.toLowerCase() === 'z')) {
+        e.preventDefault();
+        if (historyStep < history.length - 1) {
+          restoreState(historyStep + 1);
+          emitCanvasStateThrottled();
+        }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [historyStep, history.length, restoreState, emitCanvasStateThrottled]);
+
+  const handleDownloadImage = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const dataURL = canvas.toDataURL('image/png');
+    const link = document.createElement('a');
+    link.href = dataURL;
+    link.download = `whiteboard_${Date.now()}.png`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }, []);
+
+  // Scrollable container: update JSX
   return (
     <div className="h-full flex flex-col bg-white border border-gray-300 rounded-lg">
-      {/* Header */}
       <div className="p-3 bg-gray-100 border-b border-gray-300 flex items-center justify-between flex-wrap gap-2">
         <div className="text-sm font-medium text-gray-700">🎨 Custom Whiteboard</div>
         
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Tools */}
           <div className="flex gap-1 bg-white p-1 rounded">
-            {['pen', 'eraser', 'rectangle', 'circle', 'line'].map((tool) => (
+            {['pen', 'eraser', 'rectangle', 'circle', 'line', 'text'].map((tool) => (
               <button
                 key={tool}
                 onClick={() => setCurrentTool(tool)}
@@ -288,11 +406,11 @@ export const CustomWhiteboard = () => {
                 {tool === 'rectangle' && '⬜'}
                 {tool === 'circle' && '⭕'}
                 {tool === 'line' && '📏'}
+                {tool === 'text' && '🔤'}
               </button>
             ))}
           </div>
 
-          {/* Color Picker */}
           <input
             type="color"
             value={currentColor}
@@ -300,7 +418,6 @@ export const CustomWhiteboard = () => {
             className="w-8 h-8 cursor-pointer"
           />
 
-          {/* Size Slider */}
           <div className="flex items-center gap-2">
             <input
               type="range"
@@ -313,66 +430,67 @@ export const CustomWhiteboard = () => {
             <span className="text-sm text-gray-600 w-6">{currentSize}px</span>
           </div>
 
-          {/* Share Button */}
-          <ShareButton 
-            drawingData={getCanvasData()}
-            onShare={(url) => 
-              console.log('Share URL:', url)}
-          />
-
-          {/* Actions */}
-          <div className="flex gap-1">
-            <button
-              onClick={undo}
-              disabled={historyStep <= 0}
-              className="p-2 bg-gray-500 text-white rounded text-sm disabled:opacity-50"
-              title="Undo"
-            >
-              ↶
-            </button>
-            <button
-              onClick={redo}
-              disabled={historyStep >= history.length - 1}
-              className="p-2 bg-gray-500 text-white rounded text-sm disabled:opacity-50"
-              title="Redo"
-            >
-              ↷
-            </button>
-            <button
-              onClick={clearCanvas}
-              className="p-2 bg-red-500 text-white rounded text-sm"
-              title="Clear Canvas"
-            >
-              🗑️
-            </button>
-          </div>
+          <button
+            onClick={handleDownloadImage}
+            className="p-2 bg-gray-600 text-white rounded text-sm"
+            title="Download Image"
+          >
+            ⬇️ Download Image
+          </button>
         </div>
       </div>
 
-      {/* Canvas Container */}
-      <div className="flex-1 relative">
-        <canvas
-          ref={canvasRef}
-          onMouseDown={startDrawing}
-          onMouseMove={draw}
-          onMouseUp={stopDrawing}
-          onMouseOut={stopDrawing}
-          onMouseEnter={updateCoordinates}
-          className="absolute inset-0 w-full h-full"
-          style={{ cursor: currentTool === 'pen' ? 'crosshair' : 'default' }}
-        />
+      <div className="flex-1 relative overflow-auto">
+        <div className="absolute" style={{ width: LARGE_CANVAS_SIZE, height: LARGE_CANVAS_SIZE }}>
+          <canvas
+            ref={canvasRef}
+            onMouseDown={startDrawing}
+            onMouseMove={draw}
+            onMouseUp={stopDrawing}
+            onMouseOut={stopDrawing}
+            onMouseEnter={updateCoordinates}
+            className="w-full h-full"
+            style={{ cursor: currentTool === 'pen' ? 'crosshair' : 'default' }}
+          />
+          {textBox.visible && (
+            <input
+              ref={textInputRef}
+              value={textBox.value}
+              onChange={(e) => setTextBox((t) => ({ ...t, value: e.target.value }))}
+              onBlur={() => {
+                if (!ctx.current) { setTextBox((t) => ({ ...t, visible: false })); return; }
+                const val = textBox.value.trim();
+                if (val) {
+                  ctx.current.fillStyle = currentColor;
+                  ctx.current.font = `${Math.max(10, currentSize * 4)}px sans-serif`;
+                  ctx.current.fillText(val, textBox.x, textBox.y);
+                  saveState();
+                  emitCanvasStateThrottled();
+                }
+                setTextBox((t) => ({ ...t, visible: false, value: '' }));
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  (e.currentTarget as HTMLInputElement).blur();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setTextBox((t) => ({ ...t, visible: false, value: '' }));
+                }
+              }}
+              className="absolute bg-transparent border border-gray-400 text-black outline-none"
+              style={{ left: textBox.x, top: textBox.y, color: currentColor, fontSize: Math.max(10, currentSize * 4) }}
+              placeholder="Type..."
+            />
+          )}
+        </div>
       </div>
 
-      {/* Status Bar */}
       <div className="p-2 bg-gray-100 border-t border-gray-300 text-sm text-gray-600 flex justify-between">
         <div>{coordinates}</div>
         <div className="flex gap-4">
           <span>Ready to draw • Press and drag to start</span>
-          {shareUrl && (
-            <span className="text-blue-600">
-              Shared: <a href={shareUrl} className="underline" target="_blank" rel="noopener noreferrer">View</a>
-            </span>
-          )}
+          {/* Share status removed */}
         </div>
       </div>
     </div>

@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, MutableRefObject, useRef } from 'react';
+import type { Socket } from 'socket.io-client';
 import Editor from '@monaco-editor/react';
 import { Play, Loader2 } from 'lucide-react';
 import { ShareButton } from './ShareButton';
@@ -14,84 +15,47 @@ interface ExecutionResult {
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
-const defaultCode: { [key: string]: string } = {
-  python: `# Welcome to CollabCode Canvas!
-def fibonacci(n):
-    if n <= 1:
-        return n
-    return fibonacci(n - 1) + fibonacci(n - 2)
-
-print("Fibonacci sequence:")
-for i in range(10):
-    print(f"F({i}) = {fibonacci(i)}")`,
-
-  javascript: `// Welcome to CollabCode Canvas!
-function fibonacci(n) {
-    if (n <= 1) return n;
-    return fibonacci(n - 1) + fibonacci(n - 2);
+interface CodeEditorProps {
+  roomId?: string;
+  socket?: MutableRefObject<Socket | null>;
+  initialCode?: string;
+  initialLanguage?: string;
 }
 
-console.log("Fibonacci sequence:");
-for (let i = 0; i < 10; i++) {
-    console.log(\`F(\${i}) = \${fibonacci(i)}\`);
-}`,
-
-  cpp: `// Welcome to CollabCode Canvas!
-#include <iostream>
-using namespace std;
-
-int fibonacci(int n) {
-    if (n <= 1) return n;
-    return fibonacci(n - 1) + fibonacci(n - 2);
-}
-
-int main() {
-    cout << "Fibonacci sequence:" << endl;
-    for (int i = 0; i < 10; i++) {
-        cout << "F(" << i << ") = " << fibonacci(i) << endl;
-    }
-    return 0;
-}`,
-
-  java: `// Welcome to CollabCode Canvas!
-public class Main {
-    public static int fibonacci(int n) {
-        if (n <= 1) return n;
-        return fibonacci(n - 1) + fibonacci(n - 2);
-    }
-
-    public static void main(String[] args) {
-        System.out.println("Fibonacci sequence:");
-        for (int i = 0; i < 10; i++) {
-            System.out.println("F(" + i + ") = " + fibonacci(i));
-        }
-    }
-}`,
-
-  c: `// Welcome to CollabCode Canvas!
-#include <stdio.h>
-
-int fibonacci(int n) {
-    if (n <= 1) return n;
-    return fibonacci(n - 1) + fibonacci(n - 2);
-}
-
-int main() {
-    printf("Fibonacci sequence:\\n");
-    for (int i = 0; i < 10; i++) {
-        printf("F(%d) = %d\\n", i, fibonacci(i));
-    }
-    return 0;
-}`
-};
-
-export const CodeEditor = () => {
-  const [code, setCode] = useState<string>(defaultCode.python);
+export const CodeEditor = ({ roomId, socket, initialCode, initialLanguage }: CodeEditorProps) => {
+  const [code, setCode] = useState<string>('');
   const [language, setLanguage] = useState('python');
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<ExecutionResult | null>(null);
   const [stdin, setStdin] = useState('');
   const [shareUrl, setShareUrl] = useState('');
+  const isRemoteUpdate = useRef(false);
+
+  // Load persisted state
+  useEffect(() => {
+    if (!roomId) return;
+    if (typeof initialCode === 'string' || typeof initialLanguage === 'string') {
+      if (typeof initialLanguage === 'string') setLanguage(initialLanguage);
+      if (typeof initialCode === 'string') setCode(initialCode);
+      return;
+    }
+    try {
+      const saved = localStorage.getItem(`code:${roomId}`);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed.code === 'string') setCode(parsed.code);
+        if (typeof parsed.language === 'string') setLanguage(parsed.language);
+      }
+    } catch {}
+  }, [roomId, initialCode, initialLanguage]);
+
+  // Persist state
+  useEffect(() => {
+    if (!roomId) return;
+    try {
+      localStorage.setItem(`code:${roomId}`, JSON.stringify({ code, language }));
+    } catch {}
+  }, [roomId, code, language]);
 
   const handleRunCode = async () => {
     setIsRunning(true);
@@ -130,13 +94,33 @@ export const CodeEditor = () => {
 
   const handleLanguageChange = (newLanguage: string) => {
     setLanguage(newLanguage);
-    setCode(defaultCode[newLanguage] || `// Write your ${newLanguage} code here`);
     setResult(null);
   };
 
+  // Socket: outbound updates
+  useEffect(() => {
+    if (!roomId || !socket?.current) return;
+    if (isRemoteUpdate.current) { isRemoteUpdate.current = false; return; }
+    socket.current.emit('code_change', { roomId, code, language });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code, language]);
+
+  // Socket: inbound updates
+  useEffect(() => {
+    if (!socket?.current) return;
+    const s = socket.current;
+    const handler = ({ code: newCode, language: newLang }: { code: string; language: string }) => {
+      isRemoteUpdate.current = true;
+      if (newLang && newLang !== language) setLanguage(newLang);
+      if (typeof newCode === 'string' && newCode !== code) setCode(newCode);
+    };
+    s.on('code_update', handler);
+    return () => { s.off('code_update', handler); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [socket?.current, language, code]);
+
   return (
     <div className="h-full flex flex-col bg-gray-800">
-      {/* Toolbar */}
       <div className="p-3 bg-gray-700 flex items-center gap-3 flex-wrap">
         <select
           value={language}
@@ -171,7 +155,6 @@ export const CodeEditor = () => {
       </div>
 
       <div className="flex-1 flex flex-col">
-        {/* Editor */}
         <div className="flex-1">
           <Editor
             height="100%"
@@ -189,7 +172,6 @@ export const CodeEditor = () => {
           />
         </div>
 
-        {/* Output Panel */}
         <div className="h-48 border-t border-gray-600">
           <div className="p-2 bg-gray-700 border-b border-gray-600 flex items-center justify-between">
             <span className="text-sm font-medium">Output</span>

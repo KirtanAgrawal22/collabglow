@@ -16,6 +16,16 @@ export const ShareButton = ({ code, language, drawingData, onShare }: ShareButto
   const [isCopied, setIsCopied] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
 
+  const handleDownloadImage = () => {
+    if (!drawingData?.dataURL) return;
+    const a = document.createElement('a');
+    a.href = drawingData.dataURL;
+    a.download = `whiteboard-${Date.now()}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
   const handleShare = () => {
     const shareData = {
       code,
@@ -26,21 +36,28 @@ export const ShareButton = ({ code, language, drawingData, onShare }: ShareButto
     };
 
     const shareUrl = generateShareUrl(shareData);
-    
-    if (navigator.share) {
-      // Use native share API if available
-      navigator.share({
-        title: 'Check out my code and drawing!',
-        text: 'I created this using CollabCode Canvas',
-        url: shareUrl,
-      }).catch(console.error);
-    } else {
-      // Fallback to copy to clipboard
-      setIsOpen(true);
-      if (onShare) {
-        onShare(shareUrl);
+
+    try {
+      if (typeof navigator !== 'undefined' && 'share' in navigator) {
+        navigator
+          .share({
+            title: 'Check out my code and drawing!',
+            text: 'I created this using CollabCode Canvas',
+            url: shareUrl,
+          })
+          .then(() => onShare && onShare(shareUrl))
+          .catch(() => {
+            // Fall back to popup
+            setIsOpen(true);
+            onShare && onShare(shareUrl);
+          });
+        return;
       }
-    }
+    } catch {}
+
+    // Fallback to popup
+    setIsOpen(true);
+    if (onShare) onShare(shareUrl);
   };
 
   const handleCopy = () => {
@@ -62,13 +79,23 @@ export const ShareButton = ({ code, language, drawingData, onShare }: ShareButto
 
   return (
     <div className="relative">
-      <button
-        onClick={handleShare}
-        className="flex items-center gap-2 px-3 py-2 bg-blue-500 text-white rounded text-sm hover:bg-blue-600 transition-colors"
-      >
-        <Share2 size={16} />
-        Share
-      </button>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={handleShare}
+          className="flex items-center gap-2 px-3 py-2 bg-blue-500 text-white rounded text-sm hover:bg-blue-600 transition-colors"
+        >
+          <Share2 size={16} />
+          Share
+        </button>
+        {drawingData?.dataURL && (
+          <button
+            onClick={handleDownloadImage}
+            className="px-3 py-2 bg-gray-600 text-white rounded text-sm hover:bg-gray-700 transition-colors"
+          >
+            Download Image
+          </button>
+        )}
+      </div>
 
       {isOpen && (
         <div className="absolute top-full right-0 mt-2 bg-white border border-gray-300 rounded-lg shadow-lg p-4 z-50 min-w-80">
